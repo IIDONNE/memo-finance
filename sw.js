@@ -1,5 +1,5 @@
 // Keeps Memo Finance working offline. Network first, so updates show up when you're online.
-const CACHE = "memo-finance-v1";
+const CACHE = "memo-finance-v5";
 const ASSETS = ["./", "./index.html", "./manifest.webmanifest", "./apple-touch-icon.png", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", e => {
