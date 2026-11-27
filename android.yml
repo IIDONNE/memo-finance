@@ -1,0 +1,335 @@
+# Builds the Memo Finance Android app (APK) from the web app in this repository.
+# It runs by itself whenever index.html changes, or by hand from the Actions tab.
+# The finished APK is published under Releases as "Memo Finance APK".
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["index.html", "icon-512.png", ".github/workflows/android.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the signing key
+        env:
+          KS: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          if [ -z "$KS" ]; then
+            echo "::error::Add the KEYSTORE_B64 secret first: Settings > Secrets and variables > Actions > New repository secret."
+            exit 1
+          fi
+          echo "$KS" | base64 -d > "$RUNNER_TEMP/memo.keystore"
+          echo "KEYSTORE_PATH=$RUNNER_TEMP/memo.keystore" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Create the Android project
+        run: |
+          mkdir -p app/app/src/main/java/com/memo/finance app/app/src/main/assets/www app/app/src/main/res/mipmap-anydpi-v26
+          cp index.html app/app/src/main/assets/www/
+          for f in manifest.webmanifest icon-192.png icon-512.png apple-touch-icon.png; do [ -f "$f" ] && cp "$f" app/app/src/main/assets/www/ || true; done
+
+          cat > app/settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+            repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+            repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "MemoFinance"
+          include ":app"
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins { id "com.android.application" version "8.5.2" apply false }
+          EOF
+
+          cat > app/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF
+
+          cat > app/app/build.gradle <<'EOF'
+          plugins { id "com.android.application" }
+          android {
+            namespace "com.memo.finance"
+            compileSdk 34
+            defaultConfig {
+              applicationId "com.memo.finance"
+              minSdk 24
+              targetSdk 34
+              versionCode (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInteger()
+              versionName "4." + (System.getenv("GITHUB_RUN_NUMBER") ?: "1")
+            }
+            signingConfigs {
+              release {
+                storeFile file(System.getenv("KEYSTORE_PATH"))
+                storePassword "memofinance"
+                keyAlias "memo"
+                keyPassword "memofinance"
+              }
+            }
+            buildTypes {
+              release { minifyEnabled false; signingConfig signingConfigs.release }
+            }
+            lint { checkReleaseBuilds false; abortOnError false }
+            compileOptions {
+              sourceCompatibility JavaVersion.VERSION_17
+              targetCompatibility JavaVersion.VERSION_17
+            }
+          }
+          EOF
+
+          cat > app/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.INTERNET" />
+            <application
+              android:label="Memo Finance"
+              android:icon="@mipmap/ic_launcher"
+              android:roundIcon="@mipmap/ic_launcher"
+              android:allowBackup="true"
+              android:supportsRtl="true"
+              android:theme="@android:style/Theme.Material.NoActionBar">
+              <activity
+                android:name=".MainActivity"
+                android:exported="true"
+                android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode"
+                android:windowSoftInputMode="adjustResize">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+
+          cat > app/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+            <background android:drawable="@mipmap/ic_launcher_bg" />
+            <foreground android:drawable="@android:color/transparent" />
+          </adaptive-icon>
+          EOF
+
+          cat > app/app/src/main/java/com/memo/finance/MainActivity.java <<'EOF'
+          package com.memo.finance;
+
+          import android.app.Activity;
+          import android.content.ContentValues;
+          import android.content.Intent;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import java.io.ByteArrayInputStream;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+
+          /* The app is the web app from assets/www, served at a fixed https address so its
+             saved data (localStorage) stays in one place and works offline. */
+          public class MainActivity extends Activity {
+            private static final String HOST = "appassets.androidplatform.net";
+            private static final int FILE_REQUEST = 41;
+            private WebView web;
+            private ValueCallback<Uri[]> fileCallback;
+
+            @Override
+            protected void onCreate(Bundle state) {
+              super.onCreate(state);
+              getWindow().setStatusBarColor(Color.parseColor("#0F2725"));
+              getWindow().setNavigationBarColor(Color.parseColor("#0F2725"));
+              web = new WebView(this);
+              setContentView(web);
+              WebSettings s = web.getSettings();
+              s.setJavaScriptEnabled(true);
+              s.setDomStorageEnabled(true);
+              s.setDatabaseEnabled(true);
+              s.setAllowFileAccess(false);
+              s.setAllowContentAccess(false);
+              web.addJavascriptInterface(new Bridge(), "AndroidBridge");
+              web.setWebViewClient(new WebViewClient() {
+                @Override
+                public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                  Uri u = request.getUrl();
+                  if (!HOST.equals(u.getHost())) return null;
+                  String path = u.getPath();
+                  if (path == null || path.equals("/") || path.isEmpty()) path = "/index.html";
+                  try {
+                    InputStream in = getAssets().open("www" + path);
+                    return new WebResourceResponse(mime(path), "utf-8", in);
+                  } catch (IOException e) {
+                    return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", null, new ByteArrayInputStream(new byte[0]));
+                  }
+                }
+                @Override
+                public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                  Uri u = request.getUrl();
+                  if (HOST.equals(u.getHost())) return false;
+                  try { startActivity(new Intent(Intent.ACTION_VIEW, u)); } catch (Exception ignored) { }
+                  return true;
+                }
+              });
+              web.setWebChromeClient(new WebChromeClient() {
+                @Override
+                public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
+                  if (fileCallback != null) fileCallback.onReceiveValue(null);
+                  fileCallback = callback;
+                  Intent pick = new Intent(Intent.ACTION_GET_CONTENT);
+                  pick.addCategory(Intent.CATEGORY_OPENABLE);
+                  pick.setType("*/*");
+                  try {
+                    startActivityForResult(Intent.createChooser(pick, "Choose backup file"), FILE_REQUEST);
+                  } catch (Exception e) {
+                    fileCallback = null;
+                    return false;
+                  }
+                  return true;
+                }
+              });
+              if (state != null) web.restoreState(state);
+              else web.loadUrl("https://" + HOST + "/index.html");
+            }
+
+            private static String mime(String path) {
+              String p = path.toLowerCase();
+              if (p.endsWith(".html")) return "text/html";
+              if (p.endsWith(".js")) return "application/javascript";
+              if (p.endsWith(".css")) return "text/css";
+              if (p.endsWith(".png")) return "image/png";
+              if (p.endsWith(".json") || p.endsWith(".webmanifest")) return "application/json";
+              return "application/octet-stream";
+            }
+
+            @Override
+            protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+              if (requestCode == FILE_REQUEST && fileCallback != null) {
+                Uri[] result = null;
+                if (resultCode == RESULT_OK && data != null && data.getData() != null) result = new Uri[] { data.getData() };
+                fileCallback.onReceiveValue(result);
+                fileCallback = null;
+                return;
+              }
+              super.onActivityResult(requestCode, resultCode, data);
+            }
+
+            @Override
+            public void onBackPressed() {
+              web.evaluateJavascript("window.__back ? window.__back() : false", value -> {
+                if (!"true".equals(value)) finish();
+              });
+            }
+
+            @Override protected void onPause() { web.onPause(); super.onPause(); }
+            @Override protected void onResume() { super.onResume(); web.onResume(); }
+            @Override protected void onSaveInstanceState(Bundle out) { super.onSaveInstanceState(out); web.saveState(out); }
+
+            /* Called from the web app to save backups, Excel reports and calendar files. */
+            private class Bridge {
+              @JavascriptInterface
+              public String saveFile(String name, String base64, String mime) {
+                try {
+                  byte[] bytes = Base64.decode(base64, Base64.DEFAULT);
+                  Uri uri = null;
+                  String where;
+                  if (Build.VERSION.SDK_INT >= 29) {
+                    ContentValues cv = new ContentValues();
+                    cv.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+                    cv.put(MediaStore.MediaColumns.MIME_TYPE, mime);
+                    cv.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/MemoFinance");
+                    uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv);
+                    if (uri == null) return "";
+                    try (OutputStream os = getContentResolver().openOutputStream(uri)) { os.write(bytes); }
+                    where = "Downloads/MemoFinance";
+                  } else {
+                    File dir = new File(getExternalFilesDir(null), "MemoFinance");
+                    if (!dir.exists()) dir.mkdirs();
+                    File f = new File(dir, name);
+                    try (FileOutputStream os = new FileOutputStream(f)) { os.write(bytes); }
+                    where = f.getParent();
+                  }
+                  if (uri != null && mime.startsWith("text/calendar")) {
+                    final Uri open = uri;
+                    runOnUiThread(() -> {
+                      try {
+                        Intent view = new Intent(Intent.ACTION_VIEW);
+                        view.setDataAndType(open, "text/calendar");
+                        view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                        startActivity(view);
+                      } catch (Exception ignored) { }
+                    });
+                  }
+                  return where;
+                } catch (Exception e) {
+                  return "";
+                }
+              }
+            }
+          }
+          EOF
+
+      - name: Make the app icons from icon-512.png
+        run: |
+          pip install --quiet pillow
+          python3 - <<'EOF'
+          from PIL import Image, ImageDraw
+          import os
+          src = Image.open("icon-512.png").convert("RGBA")
+          res = "app/app/src/main/res"
+          for folder, px in {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}.items():
+              d = f"{res}/mipmap-{folder}"; os.makedirs(d, exist_ok=True)
+              ic = src.resize((px, px), Image.LANCZOS)
+              mask = Image.new("L", (px, px), 0); ImageDraw.Draw(mask).rounded_rectangle([0, 0, px - 1, px - 1], radius=int(px * 0.22), fill=255)
+              out = Image.new("RGBA", (px, px), (0, 0, 0, 0)); out.paste(ic, (0, 0), mask); out.save(f"{d}/ic_launcher.png")
+              src.resize((px * 9 // 4, px * 9 // 4), Image.LANCZOS).save(f"{d}/ic_launcher_bg.png")
+          EOF
+
+      - name: Build the APK
+        working-directory: app
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Name the APK
+        run: cp app/app/build/outputs/apk/release/app-release.apk MemoFinance.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MemoFinance-APK
+          path: MemoFinance.apk
+
+      - name: Publish under Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk
+          name: Memo Finance APK
+          body: "Latest Android build of Memo Finance. Download MemoFinance.apk on your Android phone and open it to install."
+          files: MemoFinance.apk
+          make_latest: true
